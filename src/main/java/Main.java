@@ -7,6 +7,7 @@ void main() {
     var hintBag = new WindowHintBag();
     hintBag.put(WindowHint.VISIBLE, true);
     hintBag.put(WindowHint.RESIZEABLE, false);
+    hintBag.put(WindowHint.TOPMOST, true);
     hintBag.put(OpenGlHints.CONTEXT_MAJOR, 4);
     hintBag.put(OpenGlHints.CONTEXT_MINOR, 5);
 
@@ -24,16 +25,27 @@ void createWindow(WindowHintBag hintBag) {
 
         Random random = new Random();
 
-        window.setMouseButtonCallback((x, y, button, pressed) -> {
-            IO.println("X: " + x + " Y: " + y + " B: " + button + " P:" + pressed);
-            srnRed = random.nextInt(0, 256);
-            srnGreen = random.nextInt(0, 256);
-            srnBlue = random.nextInt(0, 256);
+        window.addEventListener(new WindowEventListener() {
+            @Override
+            public void onMouseButton(int x, int y, int button, boolean pressed) {
+                srnRed = random.nextInt(0, 256);
+                srnGreen = random.nextInt(0, 256);
+                srnBlue = random.nextInt(0, 256);
+            }
+
+            @Override
+            public void onChar(int codepoint) {
+                IO.println((char) codepoint);
+            }
+
+            @Override
+            public void onTheme(Theme theme) {
+                IO.println("Theme changed " + theme);
+            }
         });
 
-        window.setCursorPosCallback((x, y) -> {
-            IO.println("X: " + x + " Y: " + y);
-        });
+        long lastTime = System.nanoTime();
+        int frames = 0;
 
         while (!window.shouldClose()) {
             window.pollEvents();
@@ -42,6 +54,16 @@ void createWindow(WindowHintBag hintBag) {
             GL.glClear(GL.GL_COLOR_BUFFER_BIT | GL.GL_DEPTH_BUFFER_BIT);
 
             window.swapBuffers();
+            ++frames;
+
+            long now = System.nanoTime();
+            if (now - lastTime > 1_000_000_000L) {
+                lastTime += 1_000_000_000L;
+                window.setTitle(frames + " FPS");
+                frames = 0;
+            }
+
+            Thread.onSpinWait();
         }
     }
 }

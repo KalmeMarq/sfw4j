@@ -1,22 +1,21 @@
 package io.github.kalmemarq.sfw4j.win32;
 
+import io.github.kalmemarq.sfw4j.MemoryStack;
+import io.github.kalmemarq.sfw4j.Theme;
 import io.github.kalmemarq.sfw4j.Window;
+import io.github.kalmemarq.sfw4j.WindowEventListener;
+import io.github.kalmemarq.sfw4j.hints.OpenGlHints;
 import io.github.kalmemarq.sfw4j.hints.WindowHint;
 import io.github.kalmemarq.sfw4j.hints.WindowHintBag;
-import io.github.kalmemarq.sfw4j.callbacks.CursorPosCallback;
-import io.github.kalmemarq.sfw4j.callbacks.KeyCallback;
-import io.github.kalmemarq.sfw4j.callbacks.MouseButtonCallback;
-import io.github.kalmemarq.sfw4j.win32.Win32.MSG;
-import io.github.kalmemarq.sfw4j.win32.Win32.PIXELFORMATDESCRIPTOR;
-import io.github.kalmemarq.sfw4j.win32.Win32.RECT;
-import io.github.kalmemarq.sfw4j.win32.Win32.WNDCLASSEXW;
 
 import java.lang.foreign.*;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -39,9 +38,8 @@ public class Win32Window implements Window {
     private boolean shouldClose;
     private final MSG msg = new MSG(Arena.global());
 
-    private KeyCallback keyCallback;
-    private MouseButtonCallback mouseButtonCallback;
-    private CursorPosCallback cursorPosCallback;
+    private final List<WindowEventListener> listeners;
+    private Theme theme = Theme.Light.DEFAULT;
 
     public static void setWindowClassName(String className) {
         winClassName = className;
@@ -60,6 +58,8 @@ public class Win32Window implements Window {
     }
 
     public Win32Window(int width, int height, String title, WindowHintBag hintBag) {
+        this.listeners = new ArrayList<>();
+
         this.id = WINDOW_ID.addAndGet(1);
         WINDOWS.put(this.id, this);
 
@@ -69,31 +69,34 @@ public class Win32Window implements Window {
             WNDCLASSEXW wc = new WNDCLASSEXW(arena);
             wc.cbSize((int) WNDCLASSEXW.SIZE);
             wc.style(Win32.CS_HREDRAW | Win32.CS_VREDRAW | Win32.CS_OWNDC);
-            wc.hInstance(Win32.GetModuleHandleW(MemorySegment.NULL));
+            wc.hInstance(Kernel32.INSTANCE.GetModuleHandleW(MemorySegment.NULL));
             wc.lpfnWndProc(wndProcMemSeg);
             wc.lpszClassName(arena.allocateFrom(winClassName, StandardCharsets.UTF_16LE));
             wc.cbClsExtra((int) ValueLayout.JAVA_LONG.byteSize());
 
-            Win32.RegisterClassExW(wc.memorySegment());
+            User32.INSTANCE.RegisterClassExW(wc.memorySegment());
 
             RECT rect = new RECT(arena);
             rect.right(width);
             rect.bottom(height);
 
-            int windowStyle = Win32.WS_OVERLAPPED | Win32.WS_CAPTION | Win32.WS_SYSMENU;
+            int windowStyle = Win32.WS_OVERLAPPED | Win32.WS_CAPTION | Win32.WS_SYSMENU | Win32.WS_THICKFRAME;
+            int windowExStyle = Win32.WS_EX_APPWINDOW;
+
             if (hintBag.getOr(WindowHint.MINIMIZABLE, true)) {
                 windowStyle |= Win32.WS_MINIMIZEBOX;
             }
             if (hintBag.getOr(WindowHint.MAXIMIZABLE, true)) {
                 windowStyle |= Win32.WS_MAXIMIZEBOX;
             }
-            if (hintBag.getOr(WindowHint.RESIZEABLE, true)) {
-                windowStyle |= Win32.WS_THICKFRAME;
+            if (!hintBag.getOr(WindowHint.RESIZEABLE, true)) {
+                windowStyle ^= Win32.WS_THICKFRAME;
+                windowStyle ^= Win32.WS_MAXIMIZEBOX;
+            }
+            if (hintBag.getOr(WindowHint.TOPMOST, false)) {
+                windowExStyle |= Win32.WS_EX_TOPMOST;
             }
 
-            if (hintBag.getOr(WindowHint.VISIBLE, true)) {
-                windowStyle |= Win32.WS_VISIBLE;
-            }
             if (hintBag.getOr(WindowHint.MINIMIZED, false)) {
                 windowStyle |= Win32.WS_MINIMIZE;
             }
@@ -101,10 +104,10 @@ public class Win32Window implements Window {
                 windowStyle |= Win32.WS_MAXIMIZE;
             }
 
-            Win32.AdjustWindowRect(rect.memorySegment(), windowStyle, false);
+            User32.INSTANCE.AdjustWindowRect(rect.memorySegment(), windowStyle, 0);
 
-            this.hwnd = Win32.CreateWindowExW(
-                    0,
+            this.hwnd = User32.INSTANCE.CreateWindowExW(
+                    windowExStyle,
                     wc.lpszClassName(),
                     arena.allocateFrom(title, StandardCharsets.UTF_16LE),
                     windowStyle,
@@ -119,88 +122,102 @@ public class Win32Window implements Window {
             );
 
             this.idMemSeg = Arena.global().allocateFrom(ValueLayout.JAVA_LONG, this.id);
-            Win32.SetPropA(this.hwnd, ID_PROP_MEM_SEG, this.idMemSeg);
+            User32.INSTANCE.SetPropA(this.hwnd, ID_PROP_MEM_SEG, this.idMemSeg);
+            if (Win32.isUsingDarkTheme()) {
+                Dwmapi.INSTANCE.DwmSetWindowAttribute(this.hwnd, 20, arena.allocateFrom(ValueLayout.JAVA_INT, 1), (int) ValueLayout.JAVA_INT.byteSize());
+                this.theme = Theme.Dark.DEFAULT;
+            }
 
-            this.dc = Win32.GetDC(this.hwnd);
+            this.dc = User32.INSTANCE.GetDC(this.hwnd);
 
-            int redBits = hintBag.getOr(WindowHint.RED_BITS, 8);
-            int greenBits = hintBag.getOr(WindowHint.GREEN_BITS, 8);
-            int blueBits = hintBag.getOr(WindowHint.BLUE_BITS, 8);
-            int alphaBits = hintBag.getOr(WindowHint.ALPHA_BITS, 8);
+            int redBits = hintBag.getOr(OpenGlHints.RED_BITS, 8);
+            int greenBits = hintBag.getOr(OpenGlHints.GREEN_BITS, 8);
+            int blueBits = hintBag.getOr(OpenGlHints.BLUE_BITS, 8);
+            int alphaBits = hintBag.getOr(OpenGlHints.ALPHA_BITS, 8);
 
             PIXELFORMATDESCRIPTOR pfd = new PIXELFORMATDESCRIPTOR(arena);
             pfd.nSize((short) PIXELFORMATDESCRIPTOR.SIZE);
             pfd.nVersion((short) 1);
             pfd.dwFlags(Win32.PFD_DRAW_TO_WINDOW | Win32.PFD_SUPPORT_OPENGL | Win32.PFD_DOUBLEBUFFER);
             pfd.iPixelType((byte) Win32.PFD_TYPE_RGBA);
-            pfd.cAccumRedBits((byte) (int) hintBag.getOr(WindowHint.ACCUM_RED_BITS, 0));
-            pfd.cAccumGreenBits((byte) (int) hintBag.getOr(WindowHint.ACCUM_GREEN_BITS, 0));
-            pfd.cAccumBlueBits((byte) (int) hintBag.getOr(WindowHint.ACCUM_BLUE_BITS, 0));
-            pfd.cAccumAlphaBits((byte) (int) hintBag.getOr(WindowHint.ACCUM_ALPHA_BITS, 0));
+            pfd.cAccumRedBits((byte) (int) hintBag.getOr(OpenGlHints.ACCUM_RED_BITS, 0));
+            pfd.cAccumGreenBits((byte) (int) hintBag.getOr(OpenGlHints.ACCUM_GREEN_BITS, 0));
+            pfd.cAccumBlueBits((byte) (int) hintBag.getOr(OpenGlHints.ACCUM_BLUE_BITS, 0));
+            pfd.cAccumAlphaBits((byte) (int) hintBag.getOr(OpenGlHints.ACCUM_ALPHA_BITS, 0));
             pfd.cColorBits((byte) (redBits + greenBits + blueBits + alphaBits));
             pfd.cRedBits((byte) redBits);
             pfd.cGreenBits((byte) greenBits);
             pfd.cBlueBits((byte) blueBits);
             pfd.cAlphaBits((byte) alphaBits);
-            pfd.cDepthBits((byte) (int) hintBag.getOr(WindowHint.DEPTH_BITS, 24));
-            pfd.cStencilBits((byte) (int) hintBag.getOr(WindowHint.STENCIL_BITS, 8));
+            pfd.cDepthBits((byte) (int) hintBag.getOr(OpenGlHints.DEPTH_BITS, 24));
+            pfd.cStencilBits((byte) (int) hintBag.getOr(OpenGlHints.STENCIL_BITS, 8));
             pfd.iLayerType((byte) Win32.PFD_MAIN_PLANE);
 
-            int pixel_format = Win32.ChoosePixelFormat(this.dc, pfd.memorySegment());
-            Win32.SetPixelFormat(this.dc, pixel_format, pfd.memorySegment());
-            this.dummy_context = Win32.wglCreateContext(this.dc);
+            int pixel_format = Gdi32.INSTANCE.ChoosePixelFormat(this.dc, pfd.memorySegment());
+            Gdi32.INSTANCE.SetPixelFormat(this.dc, pixel_format, pfd.memorySegment());
+            this.dummy_context = OpenGl32.INSTANCE.wglCreateContext(this.dc);
             this.makeContextCurrent();
 
-            Win32.UpdateWindow(this.hwnd);
+            if (hintBag.getOr(WindowHint.VISIBLE, true)) {
+                User32.INSTANCE.ShowWindow(this.hwnd, Win32.SW_SHOW);
+            }
+            User32.INSTANCE.UpdateWindow(this.hwnd);
         }
     }
 
     @Override
-    public void setKeyCallback(KeyCallback callback) {
-        this.keyCallback = callback;
+    public Theme getTheme() {
+        return this.theme;
     }
 
     @Override
-    public void setMouseButtonCallback(MouseButtonCallback callback) {
-        this.mouseButtonCallback = callback;
+    public void addEventListener(WindowEventListener listener) {
+        this.listeners.add(listener);
     }
 
     @Override
-    public void setCursorPosCallback(CursorPosCallback callback) {
-        this.cursorPosCallback = callback;
+    public void removeEventListener(WindowEventListener listener) {
+        this.listeners.remove(listener);
+    }
+
+    @Override
+    public void setTitle(String title) {
+        try (Arena arena = Arena.ofConfined()) {
+            User32.INSTANCE.SetWindowTextW(this.hwnd, arena.allocateFrom(title, StandardCharsets.UTF_16LE));
+        }
     }
 
     public void show() {
-        Win32.ShowWindow(this.hwnd, Win32.SW_SHOW);
-        Win32.UpdateWindow(this.hwnd);
+        User32.INSTANCE.ShowWindow(this.hwnd, Win32.SW_SHOW);
+        User32.INSTANCE.UpdateWindow(this.hwnd);
     }
 
     public void hide() {
-        Win32.ShowWindow(this.hwnd, Win32.SW_HIDE);
-        Win32.UpdateWindow(this.hwnd);
+        User32.INSTANCE.ShowWindow(this.hwnd, Win32.SW_HIDE);
+        User32.INSTANCE.UpdateWindow(this.hwnd);
     }
 
     public void minimize() {
-        Win32.ShowWindow(this.hwnd, Win32.SW_MINIMIZE);
-        Win32.UpdateWindow(this.hwnd);
+        User32.INSTANCE.ShowWindow(this.hwnd, Win32.SW_MINIMIZE);
+        User32.INSTANCE.UpdateWindow(this.hwnd);
     }
 
     public void maximize() {
-        Win32.ShowWindow(this.hwnd, Win32.SW_MAXIMIZE);
-        Win32.UpdateWindow(this.hwnd);
+        User32.INSTANCE.ShowWindow(this.hwnd, Win32.SW_MAXIMIZE);
+        User32.INSTANCE.UpdateWindow(this.hwnd);
     }
 
     public void makeContextCurrent() {
-        Win32.wglMakeCurrent(this.dc, this.dummy_context);
+        OpenGl32.INSTANCE.wglMakeCurrent(this.dc, this.dummy_context);
     }
 
     public void pollEvents() {
-        while (Win32.PeekMessageW(this.msg.memorySegment(), MemorySegment.NULL, 0, 0, Win32.PM_REMOVE)) {
+        while (User32.INSTANCE.PeekMessageW(this.msg.memorySegment(), MemorySegment.NULL, 0, 0, Win32.PM_REMOVE) != 0) {
             if (this.msg.message() == Win32.WM_QUIT) {
                 this.shouldClose = true;
             } else {
-                Win32.TranslateMessage(this.msg.memorySegment());
-                Win32.DispatchMessageW(this.msg.memorySegment());
+                User32.INSTANCE.TranslateMessage(this.msg.memorySegment());
+                User32.INSTANCE.DispatchMessageW(this.msg.memorySegment());
             }
         }
     }
@@ -215,13 +232,13 @@ public class Win32Window implements Window {
     }
 
     public void swapBuffers() {
-        Win32.SwapBuffers(this.dc);
+        Gdi32.INSTANCE.SwapBuffers(this.dc);
     }
 
     @Override
     public void close() {
-        Win32.wglMakeCurrent(this.dc, MemorySegment.NULL);
-        Win32.DestroyWindow(this.hwnd);
+        OpenGl32.INSTANCE.wglMakeCurrent(this.dc, MemorySegment.NULL);
+        User32.INSTANCE.DestroyWindow(this.hwnd);
         WINDOWS.remove(this.id);
     }
 
@@ -231,47 +248,67 @@ public class Win32Window implements Window {
                 this.shouldClose = true;
                 return 0;
             }
-            case Win32.WM_LBUTTONDOWN, Win32.WM_LBUTTONUP -> {
-                if (this.mouseButtonCallback != null) {
-                    this.mouseButtonCallback.invoke((short) ((lparam) & 0xFFFFL), (short) ((lparam >> 16) & 0xFFFFL), 0, msg == Win32.WM_LBUTTONDOWN);
-                }
-            }
-            case Win32.WM_RBUTTONDOWN, Win32.WM_RBUTTONUP -> {
-                if (this.mouseButtonCallback != null) {
-                    this.mouseButtonCallback.invoke((short) ((lparam) & 0xFFFFL), (short) ((lparam >> 16) & 0xFFFFL), 1, msg == Win32.WM_RBUTTONDOWN);
-                }
-            }
-            case Win32.WM_MBUTTONDOWN, Win32.WM_MBUTTONUP -> {
-                if (this.mouseButtonCallback != null) {
-                    this.mouseButtonCallback.invoke((short) ((lparam) & 0xFFFFL), (short) ((lparam >> 16) & 0xFFFFL), 2, msg == Win32.WM_MBUTTONDOWN);
-                }
-            }
-            case Win32.WM_XBUTTONDOWN, Win32.WM_XBUTTONUP -> {
-                if (this.mouseButtonCallback != null) {
-                    this.mouseButtonCallback.invoke((short) ((lparam) & 0xFFFFL), (short) ((lparam >> 16) & 0xFFFFL), (int) ((wparam >> 16) & 0xFFFFL) + 2, msg == Win32.WM_XBUTTONDOWN);
+            case Win32.WM_LBUTTONDOWN, Win32.WM_RBUTTONDOWN, Win32.WM_MBUTTONDOWN, Win32.WM_XBUTTONDOWN,
+                 Win32.WM_LBUTTONUP, Win32.WM_RBUTTONUP, Win32.WM_MBUTTONUP, Win32.WM_XBUTTONUP -> {
+                int x = (short) ((lparam) & 0xFFFFL);
+                int y = (short) ((lparam >> 16) & 0xFFFFL);
+
+                int button = switch (msg) {
+                    case Win32.WM_LBUTTONDOWN, Win32.WM_LBUTTONUP -> 0;
+                    case Win32.WM_RBUTTONDOWN, Win32.WM_RBUTTONUP -> 1;
+                    case Win32.WM_MBUTTONDOWN, Win32.WM_MBUTTONUP -> 2;
+                    default -> (int) (((wparam >> 16) & 0xFFFFL) + 2);
+                };
+
+                boolean pressed = msg == Win32.WM_LBUTTONDOWN || msg ==  Win32.WM_RBUTTONDOWN || msg == Win32.WM_MBUTTONDOWN || msg == Win32.WM_XBUTTONDOWN;
+
+                for (var listener : this.listeners) {
+                    listener.onMouseButton(x, y, button, pressed);
                 }
             }
             case Win32.WM_MOUSEMOVE -> {
-                if (this.cursorPosCallback != null) {
-                    this.cursorPosCallback.invoke((short) ((lparam) & 0xFFFFL), (short) ((lparam >> 16) & 0xFFFFL));
+                for (var listener : this.listeners) {
+                    listener.onCursorPos((short) ((lparam) & 0xFFFFL), (short) ((lparam >> 16) & 0xFFFFL));
                 }
             }
             case Win32.WM_SYSKEYDOWN, Win32.WM_KEYDOWN -> {
-
             }
             case Win32.WM_SYSKEYUP, Win32.WM_KEYUP -> {
+            }
+            case Win32.WM_SYSCHAR, Win32.WM_CHAR -> {
+                int codepoint = (int) wparam;
 
+                for (var listener : this.listeners) {
+                    listener.onChar(codepoint);
+                }
+            }
+            case Win32.WM_SETTINGCHANGE -> {
+                String name = MemorySegment.ofAddress(lparam).reinterpret(128).getString(0, StandardCharsets.UTF_16LE);
+                if ("ImmersiveColorSet".equals(name)) {
+                    boolean isDarkTheme = Win32.isUsingDarkTheme();
+                    Theme theme = isDarkTheme ? Theme.Dark.DEFAULT : Theme.Light.DEFAULT;
+
+                    if (theme != this.theme) {
+                        this.theme = theme;
+                        try (MemoryStack stack = MemoryStack.stackPush()) {
+                            Dwmapi.INSTANCE.DwmSetWindowAttribute(this.hwnd, 20, stack.allocateFrom(ValueLayout.JAVA_INT, isDarkTheme ? 1 : 0), (int) ValueLayout.JAVA_INT.byteSize());
+                        }
+                        for (var listener : this.listeners) {
+                            listener.onTheme(theme);
+                        }
+                    }
+                }
             }
             default -> {
 //                IO.println("MSG: " + msg);
             }
         }
 
-        return Win32.DefWindowProcW(window, msg, wparam, lparam);
+        return User32.INSTANCE.DefWindowProcW(window, msg, wparam, lparam);
     }
 
     private static long globalWndProc(MemorySegment hwnd, int msg, long wParam, long lParam) {
-        MemorySegment hData = Win32.GetPropA(hwnd, ID_PROP_MEM_SEG);
+        MemorySegment hData = User32.INSTANCE.GetPropA(hwnd, ID_PROP_MEM_SEG);
         if (hData.address() != MemorySegment.NULL.address()) {
             long id = hData.reinterpret(ValueLayout.JAVA_LONG.byteSize()).get(ValueLayout.JAVA_LONG, 0L);
             Win32Window window = WINDOWS.get(id);
@@ -283,10 +320,10 @@ public class Win32Window implements Window {
 
         return switch (msg) {
             case Win32.WM_CLOSE, Win32.WM_DESTROY -> {
-                Win32.PostQuitMessage(0);
+                User32.INSTANCE.PostQuitMessage(0);
                 yield 0;
             }
-            default -> Win32.DefWindowProcW(hwnd, msg, wParam, lParam);
+            default -> User32.INSTANCE.DefWindowProcW(hwnd, msg, wParam, lParam);
         };
     }
 }

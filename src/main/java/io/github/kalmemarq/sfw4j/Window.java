@@ -1,8 +1,5 @@
 package io.github.kalmemarq.sfw4j;
 
-import io.github.kalmemarq.sfw4j.callbacks.CursorPosCallback;
-import io.github.kalmemarq.sfw4j.callbacks.KeyCallback;
-import io.github.kalmemarq.sfw4j.callbacks.MouseButtonCallback;
 import io.github.kalmemarq.sfw4j.hints.WindowHintBag;
 import io.github.kalmemarq.sfw4j.win32.Win32Window;
 
@@ -14,12 +11,15 @@ public interface Window extends AutoCloseable {
         };
     }
 
-    void setKeyCallback(KeyCallback callback);
-    void setMouseButtonCallback(MouseButtonCallback callback);
-    void setCursorPosCallback(CursorPosCallback callback);
+    Theme getTheme();
+
+    void addEventListener(WindowEventListener listener);
+    void removeEventListener(WindowEventListener listener);
 
     void makeContextCurrent();
     void swapBuffers();
+
+    void setTitle(String title);
 
     void show();
     void hide();
